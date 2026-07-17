@@ -60,6 +60,7 @@ class TestTickFlowPipelinePrefetch(unittest.TestCase):
             single_stock_notify=False,
             report_type="simple",
             analysis_delay=0,
+            daily_history_days=60,
         )
 
         def _process(code, skip_analysis=False, single_stock_notify=False, report_type=None, analysis_query_id=None, current_time=None):
@@ -76,7 +77,8 @@ class TestTickFlowPipelinePrefetch(unittest.TestCase):
 
         self.assertEqual(len(results), 5)
         self.assertEqual(events[0][0], "daily_prefetch")
-        self.assertEqual(events[0][2], 30)
+        # 日线预取窗口取自 config.daily_history_days（需覆盖 MA60），默认 60
+        self.assertEqual(events[0][2], 60)
         self.assertEqual(events[1][0], "realtime_prefetch")
         self.assertEqual(events[2][0], "name_prefetch")
         self.assertTrue(all(event[0] != "process" for event in events[:3]))

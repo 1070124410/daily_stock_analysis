@@ -53,6 +53,36 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_daily_history_days_defaults_to_sixty(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
+            config = Config._load_from_env()
+        # 默认需覆盖 MA60（≥60 交易日）
+        self.assertEqual(config.daily_history_days, 60)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_daily_history_days_env_override_and_clamp(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ, {"STOCK_LIST": "600519", "DAILY_HISTORY_DAYS": "90"}, clear=True
+        ):
+            self.assertEqual(Config._load_from_env().daily_history_days, 90)
+        # 低于下限收敛到 30
+        with patch.dict(
+            os.environ, {"STOCK_LIST": "600519", "DAILY_HISTORY_DAYS": "5"}, clear=True
+        ):
+            self.assertEqual(Config._load_from_env().daily_history_days, 30)
+        # 高于上限收敛到 250
+        with patch.dict(
+            os.environ, {"STOCK_LIST": "600519", "DAILY_HISTORY_DAYS": "999"}, clear=True
+        ):
+            self.assertEqual(Config._load_from_env().daily_history_days, 250)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_market_review_region_accepts_comma_separated_supported_values(
         self, _mock_parse_litellm_yaml, _mock_setup_env
     ):
