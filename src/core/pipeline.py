@@ -341,7 +341,11 @@ class StockAnalysisPipeline:
 
             # 从数据源获取数据
             logger.info(f"{stock_name}({code}) 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            # 抓取窗口需覆盖 MA60（≥60 交易日）。get_daily_data 按 days*2 估算日历跨度，
+            # 且 save_daily_data 按 (code,date) UPSERT，会顺带回填窗口内缺失的历史日，
+            # 因此本次抓取即可让此前仅 30 天的浅历史个股补足 MA60 深度。
+            history_days = getattr(getattr(self, "config", None), "daily_history_days", 60) or 60
+            df, source_name = self.fetcher_manager.get_daily_data(code, days=history_days)
 
             if df is None or df.empty:
                 return False, "获取数据为空"
@@ -2893,7 +2897,8 @@ class StockAnalysisPipeline:
         # === 批量预取实时行情（优化：避免每只股票都触发全量拉取）===
         # 只有股票数量 >= 5 时才进行预取，少量股票直接逐个查询更高效
         if len(stock_codes) >= 5:
-            daily_prefetch_count = self.fetcher_manager.prefetch_daily_klines(stock_codes, days=30)
+            history_days = getattr(getattr(self, "config", None), "daily_history_days", 60) or 60
+            daily_prefetch_count = self.fetcher_manager.prefetch_daily_klines(stock_codes, days=history_days)
             if daily_prefetch_count > 0:
                 logger.info(
                     "[prefetch] component=daily_kline_prefetch action=complete "

@@ -27,9 +27,10 @@ import logging
 import multiprocessing
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -1748,6 +1749,97 @@ class AkshareFetcher(BaseFetcher):
         except Exception as e:
             logger.error(f"[Akshare] 获取指数行情失败: {e}")
             return None
+
+    def get_index_history(
+        self,
+        index_code: str,
+        region: str = "cn",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取 A 股指数历史日线序列（大盘复盘走势上下文用）。
+
+        仅支持 A 股：指数代码走个股接口会误取同号个股，因此使用 akshare 指数专用接口
+        ak.index_zh_a_hist（东方财富，裸 6 位代码），失败回退 ak.stock_zh_index_daily
+        （新浪，带交易所前缀）。返回标准化 DataFrame 并复用 _calculate_indicators 计算均线。
+
+        Args:
+            index_code: 指数代码，形如 'sh000001' / 'sz399006' / '000300'
+            region: 市场区域，仅 cn 生效
+            days: 期望交易日数量（按日历日 *2 上取以覆盖非交易日）
+
+        Returns:
+            标准化 DataFrame（含 ma5/ma10/ma20），失败返回 None
+        """
+        if region != "cn":
+            return None
+
+        # 归一化为裸 6 位数字代码（sh000001 -> 000001）与带前缀代码（sh000001）
+        bare_code = re.sub(r"^(sh|sz|SH|SZ)", "", str(index_code).strip())
+        prefixed_code = str(index_code).strip().lower()
+        if not re.fullmatch(r"\d{6}", bare_code):
+            logger.debug(f"[Akshare] 非法指数代码，跳过历史获取: {index_code}")
+            return None
+
+        end_date = datetime.now().strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=max(days, 1) * 2)).strftime("%Y%m%d")
+
+        import akshare as ak
+
+        raw_df = None
+        # 渠道 1：东方财富 index_zh_a_hist（裸数字代码），中文列名与 _normalize_data 对齐
+        try:
+            self._set_random_user_agent()
+            self._enforce_rate_limit()
+            logger.info(
+                f"[API调用] ak.index_zh_a_hist(symbol={bare_code}, start={start_date}, end={end_date})"
+            )
+            raw_df = ak.index_zh_a_hist(
+                symbol=bare_code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except Exception as e:
+            logger.warning(f"[Akshare] index_zh_a_hist 获取指数 {bare_code} 失败: {e}")
+            raw_df = None
+
+        # 渠道 2：新浪 stock_zh_index_daily（带前缀代码），列名为英文 date/open/...
+        if raw_df is None or raw_df.empty:
+            try:
+                self._enforce_rate_limit()
+                logger.info(f"[API调用] ak.stock_zh_index_daily(symbol={prefixed_code})")
+                sina_df = ak.stock_zh_index_daily(symbol=prefixed_code)
+                if sina_df is not None and not sina_df.empty:
+                    # 新浪接口返回全历史且为英文列名，转为中文以复用 _normalize_data
+                    sina_df = sina_df.rename(
+                        columns={
+                            "date": "日期",
+                            "open": "开盘",
+                            "high": "最高",
+                            "low": "最低",
+                            "close": "收盘",
+                            "volume": "成交量",
+                        }
+                    )
+                    if "成交额" not in sina_df.columns:
+                        # 新浪指数无成交额，用 0 占位（下游按缺失处理）
+                        sina_df["成交额"] = 0.0
+                    if "涨跌幅" not in sina_df.columns and "收盘" in sina_df.columns:
+                        sina_df["涨跌幅"] = sina_df["收盘"].pct_change() * 100
+                        sina_df["涨跌幅"] = sina_df["涨跌幅"].fillna(0)
+                    raw_df = sina_df.tail(max(days, 1) * 2)
+            except Exception as e:
+                logger.warning(f"[Akshare] stock_zh_index_daily 获取指数 {prefixed_code} 失败: {e}")
+
+        if raw_df is None or raw_df.empty:
+            return None
+
+        # 复用现有标准化与指标计算链路
+        df = self._normalize_data(raw_df, index_code)
+        df = self._clean_data(df)
+        df = self._calculate_indicators(df)
+        return df
 
     def get_market_stats(self) -> Optional[Dict[str, Any]]:
         """

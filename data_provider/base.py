@@ -445,6 +445,29 @@ class BaseFetcher(ABC):
         """
         return None
 
+    def get_index_history(
+        self,
+        index_code: str,
+        region: str = "cn",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取单个指数的历史日线序列（大盘复盘走势上下文用，子类可选实现）。
+
+        与 get_daily_data 的区别：指数不是个股，A 股指数代码（如 sh000001）走
+        个股接口会误取到同号个股（sz000001 平安银行），因此需要独立的指数历史入口。
+
+        Args:
+            index_code: 指数代码，A 股形如 'sh000001'，美股形如 'SPX'，港股形如 'HSI'
+            region: 市场区域 cn/us/hk/jp/kr
+            days: 期望的交易日数量（实现按日历日多取以覆盖）
+
+        Returns:
+            标准化 DataFrame（含 STANDARD_COLUMNS 与 ma5/ma10/ma20），
+            无该能力或获取失败时返回 None（由上层 fail-open 处理）。
+        """
+        return None
+
     def get_daily_data(
         self,
         stock_code: str, 
@@ -2481,6 +2504,53 @@ class DataFetcherManager:
                 logger.warning(f"[{fetcher.name}] 获取指数行情失败: {e}")
                 continue
         return []
+
+    def get_index_history(
+        self,
+        index_code: str,
+        region: str = "cn",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取单个指数的历史日线序列（自动切换数据源，fail-open）。
+
+        用于大盘复盘为主要指数补充均线、量能趋势与前期高低平台等走势上下文。
+        任一数据源成功即返回；全部失败或无支持能力时返回 None，由上层降级处理，
+        不抛异常、不拖垮大盘复盘主流程。
+
+        Args:
+            index_code: 指数代码，A 股形如 'sh000001'，美股形如 'SPX'，港股形如 'HSI'
+            region: 市场区域 cn/us/hk/jp/kr
+            days: 期望交易日数量
+
+        Returns:
+            标准化 DataFrame（含 ma5/ma10/ma20），或 None
+        """
+        for fetcher in self._fetchers:
+            try:
+                df = fetcher.get_index_history(index_code, region=region, days=days)
+            except Exception as e:
+                logger.warning(
+                    "[%s] 获取指数历史失败 index=%s region=%s: %s",
+                    fetcher.name,
+                    index_code,
+                    region,
+                    e,
+                )
+                continue
+            if df is not None and not df.empty:
+                logger.info(
+                    "[%s] 获取指数历史成功 index=%s region=%s rows=%d",
+                    fetcher.name,
+                    index_code,
+                    region,
+                    len(df),
+                )
+                return df
+        logger.warning(
+            "[IndexHistory] 所有数据源均无指数历史 index=%s region=%s", index_code, region
+        )
+        return None
 
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
         """获取市场涨跌统计（自动切换数据源）"""

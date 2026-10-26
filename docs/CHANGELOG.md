@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 大盘复盘为主要指数补充多日走势上下文（MA5/10/20、均线多空排列、近5/20日涨跌、近20日高低平台、成交额较前日/较5日均量），经新增数据源入口 `DataFetcherManager.get_index_history`（A股走 akshare 指数专用接口、美股/港股走 yfinance）注入 LLM Prompt 与报告；历史缺失时 fail-open 回退到仅当日快照，不影响主流程。
+- [修复] 个股日线抓取窗口从固定 30 天（约40交易日，导致 MA60 退化为 MA20）改为可配置 `DAILY_HISTORY_DAYS`（默认60，范围30-250），并借 `(code,date)` UPSERT 顺带回填浅历史个股，使 MA60 与长周期走势可用。
 - [改进] 为 multi-agent DecisionAgent 增加内部低敏分歧摘要输入管线，作为 #1904 P1 解释输出的前置 plumbing；不改变 public API、dashboard schema 或最终解释字段。
 - [修复] 推送报告、Jinja 报告与历史 Markdown 导出复用 Web/API 的评分-action 口径：高分但旧 `operation_advice` 仍为持有且无降级原因时，建议文案与三类统计展示为买入；有明确 guardrail reason 时继续保留持有/观望。
 - [改进] GitHub Actions 每日分析工作流补齐 TickFlow 数据源环境变量映射，并收敛 README 数据源稳定性说明到完整指南。

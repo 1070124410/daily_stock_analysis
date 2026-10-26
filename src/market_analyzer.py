@@ -68,7 +68,10 @@ class MarketIndex:
     volume: float = 0.0          # 成交量（手）
     amount: float = 0.0          # 成交额（元）
     amplitude: float = 0.0       # 振幅(%)
-    
+    # 多日走势上下文（Issue: 大盘复盘缺历史走势）。默认空表示无历史数据，
+    # 下游按缺失处理并回退到仅当日快照的旧行为，不编造。
+    trend: Dict[str, Any] = field(default_factory=dict)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'code': self.code,
@@ -82,6 +85,7 @@ class MarketIndex:
             'volume': self.volume,
             'amount': self.amount,
             'amplitude': self.amplitude,
+            'trend': self.trend,
         }
 
 
@@ -430,9 +434,13 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         """
         today = datetime.now().strftime('%Y-%m-%d')
         overview = MarketOverview(date=today)
-        
+
         # 1. 获取主要指数行情（按 region 切换 A 股/美股）
         overview.indices = self._get_main_indices()
+
+        # 1.1 为每个主要指数补充多日走势上下文（均线、量能趋势、前期高低平台）
+        #     fail-open：任一指数历史缺失只影响该指数的走势字段，不影响当日快照与主流程
+        self._attach_index_trends(overview.indices)
 
         # 2. 获取涨跌统计（A 股有，美股无等效数据）
         if self.profile.has_market_stats:
@@ -490,6 +498,131 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             logger.error("[大盘] %s action=get_main_indices status=failed error=%s", self._log_context(), e)
 
         return indices
+
+    def _attach_index_trends(self, indices: List[MarketIndex]) -> None:
+        """为每个主要指数补充多日走势上下文（fail-open）。
+
+        走势来自 DataFetcherManager.get_index_history：A 股走 akshare 指数接口，
+        美股/港股等走 yfinance。单个指数历史缺失只置空该指数 trend，不抛异常、
+        不影响当日快照与大盘复盘主流程。
+        """
+        if not indices:
+            return
+        for index in indices:
+            try:
+                df = self.data_manager.get_index_history(
+                    index.code,
+                    region=self.region,
+                    days=60,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[大盘] %s action=get_index_trend status=failed code=%s error=%s",
+                    self._log_context(),
+                    index.code,
+                    exc,
+                )
+                continue
+            if df is None or df.empty:
+                logger.info(
+                    "[大盘] %s action=get_index_trend status=empty code=%s",
+                    self._log_context(),
+                    index.code,
+                )
+                continue
+            trend = self._compute_index_trend(df)
+            if trend:
+                index.trend = trend
+                logger.info(
+                    "[大盘] %s action=get_index_trend status=success code=%s rows=%d",
+                    self._log_context(),
+                    index.code,
+                    len(df),
+                )
+
+    @staticmethod
+    def _compute_index_trend(df: "pd.DataFrame") -> Dict[str, Any]:
+        """从指数历史日线计算走势摘要：均线、量能趋势、近 20 日高低平台、昨日成交额。
+
+        入参 df 由 data_provider 标准化并计算过 ma5/ma10/ma20，按日期升序。
+        全部字段为可选：无法计算的项省略，不编造。
+        """
+        try:
+            if df is None or df.empty or "close" not in df.columns:
+                return {}
+            closes = df["close"].dropna().tolist()
+            if not closes:
+                return {}
+            trend: Dict[str, Any] = {}
+
+            def _last_valid(column: str) -> Optional[float]:
+                if column not in df.columns:
+                    return None
+                series = df[column].dropna()
+                if series.empty:
+                    return None
+                return round(float(series.iloc[-1]), 2)
+
+            ma5 = _last_valid("ma5")
+            ma10 = _last_valid("ma10")
+            ma20 = _last_valid("ma20")
+            if ma5 is not None:
+                trend["ma5"] = ma5
+            if ma10 is not None:
+                trend["ma10"] = ma10
+            if ma20 is not None:
+                trend["ma20"] = ma20
+
+            latest_close = round(float(closes[-1]), 2)
+
+            # 均线多空排列判断（仅在三线齐备时给出）
+            if ma5 is not None and ma10 is not None and ma20 is not None:
+                if latest_close > ma5 > ma10 > ma20:
+                    trend["ma_alignment"] = "bull"  # 多头排列
+                elif latest_close < ma5 < ma10 < ma20:
+                    trend["ma_alignment"] = "bear"  # 空头排列
+                else:
+                    trend["ma_alignment"] = "mixed"  # 均线纠缠
+
+            # 近 20 日高低平台（前期支撑/压力参考）
+            window = 20
+            recent = df.tail(window)
+            if "high" in recent.columns and recent["high"].notna().any():
+                trend["recent_high"] = round(float(recent["high"].max()), 2)
+            if "low" in recent.columns and recent["low"].notna().any():
+                trend["recent_low"] = round(float(recent["low"].min()), 2)
+            trend["window"] = int(min(window, len(df)))
+
+            # N 日累计涨跌幅（趋势方向量化）
+            if len(closes) >= 6:
+                base = closes[-6]
+                if base:
+                    trend["change_5d_pct"] = round((closes[-1] - base) / base * 100, 2)
+            if len(closes) >= 21:
+                base = closes[-21]
+                if base:
+                    trend["change_20d_pct"] = round((closes[-1] - base) / base * 100, 2)
+
+            # 量能趋势：最新成交额 vs 前一交易日、vs 近 5 日均值
+            if "amount" in df.columns:
+                amounts = [a for a in df["amount"].tolist() if a and a > 0]
+                if len(amounts) >= 2:
+                    prev_amount = amounts[-2]
+                    trend["prev_amount"] = round(float(prev_amount), 2)
+                    if prev_amount:
+                        trend["amount_change_pct"] = round(
+                            (amounts[-1] - prev_amount) / prev_amount * 100, 2
+                        )
+                if len(amounts) >= 6:
+                    avg5 = sum(amounts[-6:-1]) / 5
+                    if avg5:
+                        trend["amount_vs_ma5_pct"] = round(
+                            (amounts[-1] - avg5) / avg5 * 100, 2
+                        )
+            return trend
+        except Exception:
+            # 走势计算失败不影响主流程，返回空表示无走势上下文
+            return {}
 
     def _get_market_statistics(self, overview: MarketOverview):
         """获取市场涨跌统计"""
@@ -895,6 +1028,7 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         # Build data blocks
         stats_block = self._build_stats_block(overview)
         indices_block = self._build_indices_block(overview)
+        index_trend_block = self._build_index_trend_block(overview)
         sector_block = self._build_sector_block(overview)
         patterns = (
             _ENGLISH_SECTION_PATTERNS
@@ -910,10 +1044,14 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
             )
 
         if indices_block:
+            # 指数当日行情表后紧跟多日走势表（如有），一并注入指数点评段
+            combined_index_block = indices_block
+            if index_trend_block:
+                combined_index_block = f"{indices_block}\n\n{index_trend_block}"
             review = self._insert_after_section(
                 review,
                 patterns["index_commentary"],
-                indices_block,
+                combined_index_block,
             )
 
         if sector_block:
@@ -1111,6 +1249,93 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
                 f"{self._format_optional_number(idx.low)} | {self._format_optional_pct(idx.amplitude)} | {amount_str} |"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _has_any_index_trend(overview: MarketOverview) -> bool:
+        return any(isinstance(idx.trend, dict) and idx.trend for idx in overview.indices)
+
+    def _format_index_trend_for_prompt(self, idx: MarketIndex, review_language: str) -> str:
+        """将单个指数的多日走势摘要压成一行喂给 LLM（数据缺失返回空串）。"""
+        trend = idx.trend if isinstance(idx.trend, dict) else {}
+        if not trend:
+            return ""
+        parts: List[str] = []
+        ma_alignment_map_zh = {"bull": "多头排列", "bear": "空头排列", "mixed": "均线纠缠"}
+        ma_alignment_map_en = {"bull": "bullish MA stack", "bear": "bearish MA stack", "mixed": "tangled MAs"}
+        if review_language == "en":
+            if trend.get("ma5") is not None and trend.get("ma20") is not None:
+                parts.append(f"MA5 {trend['ma5']} / MA20 {trend['ma20']}")
+            if trend.get("ma_alignment"):
+                parts.append(ma_alignment_map_en.get(trend["ma_alignment"], trend["ma_alignment"]))
+            if trend.get("change_5d_pct") is not None:
+                parts.append(f"5d {trend['change_5d_pct']:+.2f}%")
+            if trend.get("change_20d_pct") is not None:
+                parts.append(f"20d {trend['change_20d_pct']:+.2f}%")
+            if trend.get("recent_high") is not None and trend.get("recent_low") is not None:
+                parts.append(f"{trend.get('window', 20)}d range {trend['recent_low']}-{trend['recent_high']}")
+            if trend.get("amount_change_pct") is not None:
+                parts.append(f"turnover vs prev {trend['amount_change_pct']:+.2f}%")
+            if trend.get("amount_vs_ma5_pct") is not None:
+                parts.append(f"vs 5d avg {trend['amount_vs_ma5_pct']:+.2f}%")
+            return "trend: " + "; ".join(parts) if parts else ""
+        if trend.get("ma5") is not None and trend.get("ma20") is not None:
+            parts.append(f"MA5 {trend['ma5']} / MA20 {trend['ma20']}")
+        if trend.get("ma_alignment"):
+            parts.append(ma_alignment_map_zh.get(trend["ma_alignment"], trend["ma_alignment"]))
+        if trend.get("change_5d_pct") is not None:
+            parts.append(f"近5日 {trend['change_5d_pct']:+.2f}%")
+        if trend.get("change_20d_pct") is not None:
+            parts.append(f"近20日 {trend['change_20d_pct']:+.2f}%")
+        if trend.get("recent_high") is not None and trend.get("recent_low") is not None:
+            parts.append(f"近{trend.get('window', 20)}日区间 {trend['recent_low']}-{trend['recent_high']}")
+        if trend.get("amount_change_pct") is not None:
+            parts.append(f"成交额较前日 {trend['amount_change_pct']:+.2f}%")
+        if trend.get("amount_vs_ma5_pct") is not None:
+            parts.append(f"较5日均量 {trend['amount_vs_ma5_pct']:+.2f}%")
+        return "走势: " + "；".join(parts) if parts else ""
+
+    def _build_index_trend_block(self, overview: MarketOverview) -> str:
+        """构建指数多日走势表格（注入报告；无任何走势数据时返回空串）。"""
+        if not overview.indices or not self._has_any_index_trend(overview):
+            return ""
+        english = self._get_review_language() == "en"
+        if english:
+            lines = [
+                "| Index | MA5 | MA10 | MA20 | MA Stack | 5d % | 20d % | 20d Range | Turnover vs Prev |",
+                "|-------|-----|------|------|----------|------|-------|-----------|------------------|",
+            ]
+            stack_map = {"bull": "Bullish", "bear": "Bearish", "mixed": "Mixed"}
+        else:
+            lines = [
+                "| 指数 | MA5 | MA10 | MA20 | 均线排列 | 近5日 | 近20日 | 近20日区间 | 成交额较前日 |",
+                "|------|-----|------|------|---------|-------|--------|-----------|-------------|",
+            ]
+            stack_map = {"bull": "多头", "bear": "空头", "mixed": "纠缠"}
+
+        def _num(value: Any) -> str:
+            return f"{value:.2f}" if isinstance(value, (int, float)) else "N/A"
+
+        def _pct(value: Any) -> str:
+            return f"{value:+.2f}%" if isinstance(value, (int, float)) else "N/A"
+
+        for idx in overview.indices:
+            trend = idx.trend if isinstance(idx.trend, dict) else {}
+            if not trend:
+                continue
+            stack = stack_map.get(trend.get("ma_alignment"), "N/A")
+            if trend.get("recent_low") is not None and trend.get("recent_high") is not None:
+                rng = f"{trend['recent_low']:.2f}-{trend['recent_high']:.2f}"
+            else:
+                rng = "N/A"
+            lines.append(
+                f"| {idx.name} | {_num(trend.get('ma5'))} | {_num(trend.get('ma10'))} | "
+                f"{_num(trend.get('ma20'))} | {stack} | {_pct(trend.get('change_5d_pct'))} | "
+                f"{_pct(trend.get('change_20d_pct'))} | {rng} | {_pct(trend.get('amount_change_pct'))} |"
+            )
+        if len(lines) <= 2:
+            return ""
+        heading = "#### Index Trend (recent sessions)" if english else "#### 指数多日走势"
+        return heading + "\n" + "\n".join(lines)
 
     def _build_sector_block(self, overview: MarketOverview) -> str:
         """Build industry and concept ranking blocks."""
@@ -1402,6 +1627,9 @@ Focus on index trend, liquidity, and sector rotation to shape the next-session t
         for idx in overview.indices:
             direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
             indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+            trend_line = self._format_index_trend_for_prompt(idx, review_language)
+            if trend_line:
+                indices_text += f"  {trend_line}\n"
         
         # 板块信息
         top_sectors_text = self._format_ranking_summary(overview.top_sectors)

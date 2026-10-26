@@ -515,6 +515,92 @@ class YfinanceFetcher(BaseFetcher):
             logger.error(f"[Yfinance] 获取台湾指数行情失败: {e}")
         return None
 
+    # 指数代码（get_main_indices 返回的 code）-> yfinance 历史符号映射，按区域组织。
+    # 复用与各 _get_*_main_indices 相同的符号，避免走个股接口误取同号证券。
+    _INDEX_HISTORY_SYMBOLS: Dict[str, Dict[str, str]] = {
+        "cn": {
+            "sh000001": "000001.SS",
+            "sz399001": "399001.SZ",
+            "sz399006": "399006.SZ",
+            "sh000688": "000688.SS",
+            "sh000016": "000016.SS",
+            "sh000300": "000300.SS",
+        },
+        "hk": {
+            "HSI": "^HSI",
+            "HSTECH": "HSTECH.HK",
+            "HSCEI": "^HSCE",
+        },
+        "jp": {
+            "N225": "^N225",
+            "TOPX": "^TOPX",
+        },
+        "kr": {
+            "KS11": "^KS11",
+            "KQ11": "^KQ11",
+        },
+        "tw": {
+            "TWII": "^TWII",
+            "TWOII": "^TWOII",
+        },
+    }
+
+    def get_index_history(
+        self,
+        index_code: str,
+        region: str = "cn",
+        days: int = 60,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取指数历史日线序列（大盘复盘走势上下文用），支持 A 股/美股/港股/日/韩/台。
+
+        通过 yfinance 指数符号拉取历史，复用 _normalize_data + _calculate_indicators。
+        A 股场景作为 akshare 的兜底数据源；美股/港股等为主要数据源。
+
+        Args:
+            index_code: 指数代码，形如 'sh000001'（A 股）/ 'SPX'（美股）/ 'HSI'（港股）
+            region: 市场区域 cn/us/hk/jp/kr/tw
+            days: 期望交易日数量
+
+        Returns:
+            标准化 DataFrame（含 ma5/ma10/ma20），失败返回 None
+        """
+        # 解析 yfinance 符号
+        if region == "us":
+            yf_symbol, _name = get_us_index_yf_symbol(str(index_code).strip())
+        else:
+            yf_symbol = self._INDEX_HISTORY_SYMBOLS.get(region, {}).get(str(index_code).strip())
+        if not yf_symbol:
+            logger.debug(f"[Yfinance] 无指数历史符号映射，跳过: code={index_code} region={region}")
+            return None
+
+        # 期望交易日 -> yfinance period（按日历日多取以覆盖非交易日与节假日）
+        calendar_days = max(days, 1) * 2
+        if calendar_days <= 30:
+            period = "1mo"
+        elif calendar_days <= 90:
+            period = "3mo"
+        elif calendar_days <= 180:
+            period = "6mo"
+        else:
+            period = "1y"
+
+        try:
+            import yfinance as yf
+
+            ticker = yf.Ticker(yf_symbol)
+            hist = ticker.history(period=period)
+            if hist is None or hist.empty:
+                logger.warning(f"[Yfinance] 指数历史为空: {yf_symbol}")
+                return None
+            df = self._normalize_data(hist, index_code)
+            df = self._clean_data(df)
+            df = self._calculate_indicators(df)
+            return df
+        except Exception as e:
+            logger.warning(f"[Yfinance] 获取指数历史失败 {yf_symbol}: {e}")
+            return None
+
     def _is_us_stock(self, stock_code: str) -> bool:
         """
         判断代码是否为美股股票（排除美股指数）。
